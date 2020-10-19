@@ -8,6 +8,7 @@
 
 #include "inc/Core/BKT/Index.h"
 #include "inc/Core/KDT/Index.h"
+#include "inc/Core/Common/PQQuantizer.h"
 
 #ifndef _MSC_VER
 #include "inc/Helper/ConcurrentSet.h"
@@ -76,11 +77,13 @@ VectorIndex::GetMetadata(SizeType p_vectorID) const {
 std::shared_ptr<std::vector<std::uint64_t>> VectorIndex::CalculateBufferSize() const
 {
     std::shared_ptr<std::vector<std::uint64_t>> ret = BufferSize();
-    if (m_pMetadata != nullptr)
-    {
+    if (m_pMetadata != nullptr) {
         auto metasize = m_pMetadata->BufferSize();
         ret->push_back(metasize.first);
         ret->push_back(metasize.second);
+    }
+    if (SPTAG::COMMON::DistanceUtils::Quantizer != nullptr) {
+        ret->push_back(SPTAG::COMMON::DistanceUtils::Quantizer->BufferSize());
     }
     return std::move(ret);
 }
@@ -94,6 +97,11 @@ VectorIndex::LoadIndexConfig(Helper::IniReader& p_reader)
     {
         m_sMetadataFile = p_reader.GetParameter(metadataSection, "MetaDataFilePath", std::string());
         m_sMetadataIndexFile = p_reader.GetParameter(metadataSection, "MetaDataIndexPath", std::string());
+    }
+
+    std::string quantizerSection("Quantizer");
+    if (p_reader.DoesSectionExist(quantizerSection)) {
+        m_sQuantizerFile = p_reader.GetParameter(quantizerSection, "QuantizerFilePath", std::string());
     }
 
     if (DistCalcMethod::Undefined == p_reader.GetParameter("Index", "DistCalcMethod", DistCalcMethod::Undefined))
@@ -114,6 +122,13 @@ VectorIndex::SaveIndexConfig(std::shared_ptr<Helper::DiskPriorityIO> p_configOut
         IOSTRING(p_configOut, WriteString, ("MetaDataFilePath=" + m_sMetadataFile + "\n").c_str());
         IOSTRING(p_configOut, WriteString, ("MetaDataIndexPath=" + m_sMetadataIndexFile + "\n").c_str());
         if (nullptr != m_pMetaToVec) IOSTRING(p_configOut, WriteString, "MetaDataToVectorIndex=true\n");
+        IOSTRING(p_configOut, WriteString, "\n");
+    }
+
+    if (nullptr != SPTAG::COMMON::DistanceUtils::Quantizer) {
+        IOSTRING(p_configOut, WriteString, "[Quantizer]\n");
+        IOSTRING(p_configOut, WriteString, ("QuantizerFilePath=" + m_sQuantizerFile + "\n").c_str());
+        IOSTRING(p_configOut, WriteString, ("QuantizerType=" + Helper::Convert::ConvertToString(SPTAG::COMMON::DistanceUtils::Quantizer->GetQuantizerType()) + "\n").c_str());
         IOSTRING(p_configOut, WriteString, "\n");
     }
 
@@ -188,11 +203,15 @@ VectorIndex::SaveIndex(std::string& p_config, const std::vector<ByteArray>& p_in
     }
     else 
     {
-        if (m_pMetadata != nullptr && p_indexStreams.size() > 5)
+        ret = SaveIndexData(p_indexStreams);
+        if (ErrorCode::Success == ret && m_pMetadata != nullptr && p_indexStreams.size() > 5)
         {
-            ret = m_pMetadata->SaveMetadata(p_indexStreams[p_indexStreams.size() - 2], p_indexStreams[p_indexStreams.size() - 1]);
+            ret = m_pMetadata->SaveMetadata(p_indexStreams[4], p_indexStreams[5]);
         }
-        if (ErrorCode::Success == ret) ret = SaveIndexData(p_indexStreams);
+    }
+    if (ErrorCode::Success == ret && SPTAG::COMMON::DistanceUtils::Quantizer != nullptr && p_indexStreams.size() > 4)
+    {
+        ret = SPTAG::COMMON::DistanceUtils::Quantizer->SaveQuantizer(p_indexStreams.back());
     }
     return ret;
 }
@@ -226,6 +245,9 @@ VectorIndex::SaveIndex(const std::string& p_folderPath)
         indexfiles->push_back(m_sMetadataFile);
         indexfiles->push_back(m_sMetadataIndexFile);
     }
+    if (nullptr != SPTAG::COMMON::DistanceUtils::Quantizer) {
+        indexfiles->push_back(m_sQuantizerFile);
+    }
     std::vector<std::shared_ptr<Helper::DiskPriorityIO>> handles;
     for (std::string& f : *indexfiles) {
         auto ptr = SPTAG::f_createIO();
@@ -239,9 +261,10 @@ VectorIndex::SaveIndex(const std::string& p_folderPath)
     }
     else 
     {
-        if (m_pMetadata != nullptr) ret = m_pMetadata->SaveMetadata(handles[handles.size() - 2], handles[handles.size() - 1]);
-        if (ErrorCode::Success == ret) ret = SaveIndexData(handles);
+        ret = SaveIndexData(handles);
+        if (ErrorCode::Success == ret && m_pMetadata != nullptr) ret = m_pMetadata->SaveMetadata(handles[4], handles[5]);
     }
+    if (ErrorCode::Success == ret && SPTAG::COMMON::DistanceUtils::Quantizer != nullptr)  SPTAG::COMMON::DistanceUtils::Quantizer->SaveQuantizer(handles.back());
     return ret;
 }
 
@@ -279,7 +302,9 @@ VectorIndex::SaveIndexToFile(const std::string& p_file, IAbortOperation* p_abort
 
             if (ErrorCode::Success == ret && m_pMetadata != nullptr) ret = m_pMetadata->SaveMetadata(fp, fp);
         }
+        if (ErrorCode::Success == ret && SPTAG::COMMON::DistanceUtils::Quantizer != nullptr) SPTAG::COMMON::DistanceUtils::Quantizer->SaveQuantizer(fp);
     }
+
     IOBINARY(fp, WriteBinary, sizeof(configSize), (char*)&configSize, 0);
     fp->ShutDown();
 
@@ -462,6 +487,9 @@ VectorIndex::LoadIndex(const std::string& p_loaderFilePath, std::shared_ptr<Vect
         indexfiles->push_back(p_vectorIndex->m_sMetadataFile);
         indexfiles->push_back(p_vectorIndex->m_sMetadataIndexFile);
     }
+    if (iniReader.DoesSectionExist("Quantizer")) {
+        indexfiles->push_back(p_vectorIndex->m_sQuantizerFile);
+    }
     std::vector<std::shared_ptr<Helper::DiskPriorityIO>> handles;
     for (std::string& f : *indexfiles) {
         auto ptr = SPTAG::f_createIO();
@@ -473,7 +501,7 @@ VectorIndex::LoadIndex(const std::string& p_loaderFilePath, std::shared_ptr<Vect
 
     if (iniReader.DoesSectionExist("MetaData"))
     {
-        p_vectorIndex->SetMetadata(new MemMetadataSet(handles[handles.size() - 2], handles[handles.size() - 1]));
+        p_vectorIndex->SetMetadata(new MemMetadataSet(handles[4], handles[5]));
 
         if (!(p_vectorIndex->GetMetadata()->Available()))
         {
@@ -486,6 +514,13 @@ VectorIndex::LoadIndex(const std::string& p_loaderFilePath, std::shared_ptr<Vect
             p_vectorIndex->BuildMetaMapping();
         }
     }
+    
+    if (iniReader.DoesSectionExist("Quantizer")) {
+        QuantizerType type = iniReader.GetParameter("Quantizer", "QuantizerType", QuantizerType::Undefined);
+        if ((ret = SPTAG::COMMON::Quantizer::LoadQuantizer(handles.back(), type)) != ErrorCode::Success) return ret;
+        p_vectorIndex->SetParameter("DistCalcMethod", Helper::Convert::ConvertToString(p_vectorIndex->GetDistCalcMethod()));
+    }
+
     p_vectorIndex->m_bReady = true;
     return ErrorCode::Success;
 }
@@ -537,6 +572,13 @@ VectorIndex::LoadIndexFromFile(const std::string& p_file, std::shared_ptr<Vector
             p_vectorIndex->BuildMetaMapping();
         }
     }
+
+    if (iniReader.DoesSectionExist("Quantizer")) {
+        QuantizerType type = iniReader.GetParameter("Quantizer", "QuantizerType", QuantizerType::Undefined);
+        if ((ret = SPTAG::COMMON::Quantizer::LoadQuantizer(fp, type)) != ErrorCode::Success) return ret;
+        p_vectorIndex->SetParameter("DistCalcMethod", Helper::Convert::ConvertToString(p_vectorIndex->GetDistCalcMethod()));
+    }
+
     p_vectorIndex->m_bReady = true;
     return ErrorCode::Success;
 }
@@ -559,10 +601,10 @@ VectorIndex::LoadIndex(const std::string& p_config, const std::vector<ByteArray>
 
     if ((ret = p_vectorIndex->LoadIndexDataFromMemory(p_indexBlobs)) != ErrorCode::Success) return ret;
 
-    if (iniReader.DoesSectionExist("MetaData") && p_indexBlobs.size() > 4)
+    if (iniReader.DoesSectionExist("MetaData") && p_indexBlobs.size() > 5)
     {
-        ByteArray pMetaIndex = p_indexBlobs[p_indexBlobs.size() - 1];
-        p_vectorIndex->SetMetadata(new MemMetadataSet(p_indexBlobs[p_indexBlobs.size() - 2],
+        ByteArray pMetaIndex = p_indexBlobs[5];
+        p_vectorIndex->SetMetadata(new MemMetadataSet(p_indexBlobs[4],
             ByteArray(pMetaIndex.Data() + sizeof(SizeType), pMetaIndex.Length() - sizeof(SizeType), false),
             *((SizeType*)pMetaIndex.Data())));
 
@@ -577,6 +619,15 @@ VectorIndex::LoadIndex(const std::string& p_config, const std::vector<ByteArray>
             p_vectorIndex->BuildMetaMapping();
         }
     }
+
+    if (iniReader.DoesSectionExist("Quantizer") && p_indexBlobs.size() > 4) {
+        QuantizerType type = iniReader.GetParameter("Quantizer", "QuantizerType", QuantizerType::Undefined);
+        std::shared_ptr<Helper::DiskPriorityIO> bufferhandle(new Helper::SimpleBufferIO());
+        if (bufferhandle == nullptr || !bufferhandle->Initialize((char*)(p_indexBlobs.back().Data()), std::ios::binary | std::ios::in, p_indexBlobs.back().Length())) return ErrorCode::EmptyDiskIO;
+        if ((ret = SPTAG::COMMON::Quantizer::LoadQuantizer(bufferhandle, type)) != ErrorCode::Success) return ret;
+        p_vectorIndex->SetParameter("DistCalcMethod", Helper::Convert::ConvertToString(p_vectorIndex->GetDistCalcMethod()));
+    }
+
     p_vectorIndex->m_bReady = true;
     return ErrorCode::Success;
 }
